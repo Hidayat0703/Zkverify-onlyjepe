@@ -21,11 +21,31 @@
  *     secret that authenticated the request. When set (non-empty), it takes
  *     precedence over AGENT_GAMES_HMAC_SECRET.
  *   STRATEGY_SALT — decimal string, random 128-bit, generated on the host.
+ *     ALSO used as the gatekeeper circuit's private `salt` input (any salt
+ *     proves fine; the circuit output is Poseidon(salt, taskId)).
  *   STRATEGY_PARAMS — JSON array of 8 decimal strings.
  *     params[4..7] must be "0".
  *   HMAC_KEY_ENCODING — "utf8" (default, presumed: UTF-8 bytes of the secret
  *     string) or "hex" (fallback: hex-decoded secret bytes as the HMAC key).
  *   PORT — default 3123. Binds 127.0.0.1 only; public exposure via tunnel.
+ *
+ * Gatekeeper (circuit-analysis/gatekeeper/, PROVEN by probing 2026-11-15):
+ *   Task envelope type "agent-games.proof-gatekeeper.v1", input fields
+ *   registered_vk/proof_vk/minimum/public_balance/expiry_block/current_block/
+ *   recipient/condition_recipient/amount/max_transfer/proof_tx.
+ *   Circuit GatekeeperEvaluation (Groth16/BN128, 13 inputs, 13 public):
+ *   inputs registeredVkHash, proofVkHash, minimum, publicBalance, expiryBlock,
+ *   currentBlock, recipient, conditionRecipient, amount, maxTransfer,
+ *   decision, taskId, salt (private). Public signals: [Poseidon(salt,taskId),
+ *   registeredVkHash, proofVkHash, minimum, publicBalance, expiryBlock,
+ *   currentBlock, recipient, conditionRecipient, amount, maxTransfer,
+ *   decision, taskId]. decision 1=APPROVE iff every field check passes,
+ *   0=REJECT otherwise (line-102 assert; all 5 field traps + valid proven).
+ *   Reason codes (event-page trap encyclopedia, verbatim): VALID_CONDITION,
+ *   VK_SUBSTITUTION, THRESHOLD_MISMATCH, PROOF_REUSED, EXPIRED_CONDITION,
+ *   RECIPIENT_MISMATCH, AMOUNT_OVERFLOW. PROOF_REUSED tasks carry no proof
+ *   (platform excludes them); reuse is detected off-circuit via a persisted
+ *   seen-set of proof_tx values (seen-proof-tx.json next to this file).
  *
  * Security: secrets are never logged. Logs carry only booleans, action types,
  * match ids/turns, and timings. Kurier submission is NOT wired: no
@@ -478,6 +498,13 @@ async function initCrypto() {
   COMMITMENT_BIGINT = F.toObject(poseidon([...PARAMS_BIG, BigInt(SALT)]));
   COMMITMENT_DECIMAL = COMMITMENT_BIGINT.toString();
   VK = await snarkjs.zKey.exportVerificationKey(ZKEY_PATH);
+  loadSeenSet();
+  try {
+    GK_VK = await snarkjs.zKey.exportVerificationKey(GK_ZKEY_PATH);
+  } catch {
+    GK_VK = null;
+    console.error(JSON.stringify({ kind: 'warn', error: 'gatekeeper VK unavailable; gatekeeper proofs disabled' }));
+  }
 }
 
 function commitmentHex() {
@@ -502,6 +529,167 @@ async function generatePolicyProof(envelope, action) {
   const ok = await snarkjs.groth16.verify(VK, publicSignals, proof);
   if (!ok) throw new Error('local proof verification failed');
   return { proof, publicSignals };
+}
+
+// ---------------------------------------------------------- gatekeeper ---
+
+const GK_WASM_PATH = path.join(__dirname, 'gatekeeper.wasm');
+const GK_ZKEY_PATH = path.join(__dirname, 'gatekeeper_final.zkey');
+const SEEN_FILE = path.join(__dirname, 'seen-proof-tx.json');
+// BN128 scalar field prime (for taskId hashing fallback).
+const FIELD_PRIME = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+let GK_VK = null;
+
+// Persisted seen-set of proof_tx values (reuse detection is off-circuit).
+const seenProofTx = new Set();
+function loadSeenSet() {
+  try {
+    if (!fs.existsSync(SEEN_FILE)) return;
+    const arr = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
+    if (Array.isArray(arr)) for (const v of arr) if (typeof v === 'string') seenProofTx.add(v);
+  } catch { /* corrupt/empty file: start fresh, do not crash */ }
+}
+function persistSeenSet() {
+  try {
+    const arr = [...seenProofTx].slice(-10000);
+    const tmp = `${SEEN_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(arr));
+    fs.renameSync(tmp, SEEN_FILE);
+  } catch { /* persistence failure must not fail the response */ }
+}
+
+function hexToBigInt(value, name) {
+  if (typeof value !== 'string' || !/^0x[a-fA-F0-9]+$/.test(value)) {
+    throw new Error(`${name} must be a 0x hex string`);
+  }
+  return BigInt(value);
+}
+
+function decimalOrInt(value, name) {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value);
+  throw new Error(`${name} must be a non-negative integer or decimal string`);
+}
+
+// task_id -> circuit field element. The sample payload id is "gk_24_9d1"
+// (a short string); the platform's own encoding is unpublished. Encoding:
+// pure decimal -> direct; 0x-hex -> direct; anything else -> keccak256 of
+// the UTF-8 bytes, reduced mod p. Any value proves fine (salt is private);
+// this only matters if the platform re-checks publicSignals[12], which no
+// published text says it does. Flagged as best-evidenced, not verified.
+function taskIdField(taskId) {
+  if (/^\d+$/.test(taskId)) return BigInt(taskId);
+  if (/^0x[a-fA-F0-9]+$/.test(taskId)) return BigInt(taskId);
+  const hashHex = keccak256(Buffer.from(taskId, 'utf8'));
+  return BigInt(hashHex) % FIELD_PRIME;
+}
+
+function validateGatekeeperTask(obj) {
+  if (!isRecord(obj)) throw new Error('Task must be an object');
+  if (obj.type !== 'agent-games.proof-gatekeeper.v1') throw new Error('Invalid task type');
+  const taskId = nonEmptyString(obj.task_id, 'task_id');
+  if (typeof obj.mode !== 'string') throw new Error('mode must be a string');
+  for (const field of ['issued_at', 'deadline_at']) {
+    if (!Object.hasOwn(obj, field)) throw new Error(`${field} is required`);
+  }
+  if (!isRecord(obj.input)) throw new Error('input is required');
+  const inp = obj.input;
+  return {
+    type: obj.type,
+    taskId,
+    mode: obj.mode,
+    issuedAt: obj.issued_at,
+    deadlineAt: obj.deadline_at,
+    input: {
+      registeredVk: hexToBigInt(inp.registered_vk, 'registered_vk'),
+      proofVk: hexToBigInt(inp.proof_vk, 'proof_vk'),
+      minimum: decimalOrInt(inp.minimum, 'minimum'),
+      publicBalance: decimalOrInt(inp.public_balance, 'public_balance'),
+      expiryBlock: decimalOrInt(inp.expiry_block, 'expiry_block'),
+      currentBlock: decimalOrInt(inp.current_block, 'current_block'),
+      recipient: hexToBigInt(inp.recipient, 'recipient'),
+      conditionRecipient: hexToBigInt(inp.condition_recipient, 'condition_recipient'),
+      amount: decimalOrInt(inp.amount, 'amount'),
+      maxTransfer: decimalOrInt(inp.max_transfer, 'max_transfer'),
+      proofTx: nonEmptyString(inp.proof_tx, 'proof_tx'),
+    },
+    issuedAtMs: parseTimestamp(obj.issued_at),
+    deadlineAtMs: parseTimestamp(obj.deadline_at),
+  };
+}
+
+// Trap encyclopedia order (event page): VK, THRESHOLD, REUSED, EXPIRED,
+// RECIPIENT, AMOUNT. The circuit enforces the same 5 field checks; reuse is
+// off-circuit only. Seen-set records EVERY received proof_tx (the checklist
+// calls it a "seen-set" and the practice page says "not been previously
+// submitted"); a false REJECT costs -3 while a false APPROVE costs -6.
+function decideGatekeeper(task) {
+  const inp = task.input;
+  const reused = seenProofTx.has(inp.proofTx);
+  let reason = null;
+  if (inp.registeredVk !== inp.proofVk) reason = 'VK_SUBSTITUTION';
+  else if (inp.publicBalance < inp.minimum) reason = 'THRESHOLD_MISMATCH';
+  else if (reused) reason = 'PROOF_REUSED';
+  else if (inp.currentBlock > inp.expiryBlock) reason = 'EXPIRED_CONDITION';
+  else if (inp.recipient !== inp.conditionRecipient) reason = 'RECIPIENT_MISMATCH';
+  else if (inp.amount > inp.maxTransfer) reason = 'AMOUNT_OVERFLOW';
+  if (!seenProofTx.has(inp.proofTx)) {
+    seenProofTx.add(inp.proofTx);
+    persistSeenSet();
+  }
+  if (reason) return { decision: 'REJECT', reasonCode: reason };
+  return { decision: 'APPROVE', reasonCode: 'VALID_CONDITION' };
+}
+
+async function generateGatekeeperProof(task, decisionEnum) {
+  if (!GK_VK) throw new Error('gatekeeper verification key unavailable');
+  const inp = task.input;
+  const input = {
+    registeredVkHash: inp.registeredVk.toString(),
+    proofVkHash: inp.proofVk.toString(),
+    minimum: inp.minimum.toString(),
+    publicBalance: inp.publicBalance.toString(),
+    expiryBlock: inp.expiryBlock.toString(),
+    currentBlock: inp.currentBlock.toString(),
+    recipient: inp.recipient.toString(),
+    conditionRecipient: inp.conditionRecipient.toString(),
+    amount: inp.amount.toString(),
+    maxTransfer: inp.maxTransfer.toString(),
+    decision: String(decisionEnum),
+    taskId: taskIdField(task.taskId).toString(),
+    salt: BigInt(SALT).toString(),
+  };
+  const { proof, publicSignals } = await snarkjs.groth16.fullProve(input, GK_WASM_PATH, GK_ZKEY_PATH);
+  const ok = await snarkjs.groth16.verify(GK_VK, publicSignals, proof);
+  if (!ok) throw new Error('local gatekeeper proof verification failed');
+  return { proof, publicSignals };
+}
+
+async function processGatekeeper(task, rawObject) {
+  const t0 = Date.now();
+  // Full payload log: the task body carries no secrets. Kept for
+  // dispute/debugging; never log the signature header or the HMAC secret.
+  log({ kind: 'gatekeeper-payload', task_id: task.taskId, body: rawObject });
+  const { decision, reasonCode } = decideGatekeeper(task);
+  const response = { decision, reason_code: reasonCode, proof_tx: task.input.proofTx };
+  // PROOF_REUSED tasks have no proof to submit (platform excludes them).
+  if (reasonCode === 'PROOF_REUSED') {
+    log({ kind: 'gatekeeper-task', task_id: task.taskId, decision, reason_code: reasonCode, proofOk: null, latencyMs: Date.now() - t0 });
+    return response;
+  }
+  try {
+    const generated = await generateGatekeeperProof(task, decision === 'APPROVE' ? 1 : 0);
+    response.proof = generated.proof;
+    response.public_signals = generated.publicSignals;
+    log({ kind: 'gatekeeper-task', task_id: task.taskId, decision, reason_code: reasonCode, proofOk: true, latencyMs: Date.now() - t0 });
+  } catch (error) {
+    // Proving failure: still return the deterministic field decision without
+    // a proof (decision correctness dominates scoring; a missing proof on a
+    // provable task costs only -2). Loud log so it is never silent.
+    log({ kind: 'gatekeeper-task', task_id: task.taskId, decision, reason_code: reasonCode, proofOk: false, errorClass: error && error.name ? error.name : 'Error', latencyMs: Date.now() - t0 });
+  }
+  return response;
 }
 
 // ---------------------------------------------------------------- http ----
@@ -595,12 +783,14 @@ function handleRequest(req, res) {
       authenticated = true;
 
       if (req.method !== 'POST') {
+        log({ kind: 'bad-request', reason: 'method-not-post', method: req.method, path: req.url, hmacOk: true });
         sendJson(res, 400, { error: 'Bad request' }, authSecret);
         return;
       }
       try {
         rawObject = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(rawBytes));
       } catch {
+        log({ kind: 'bad-request', reason: 'json-parse', bodyPreview: rawBytes.subarray(0, 200).toString('utf8'), hmacOk: true });
         sendJson(res, 400, { error: 'Bad request' }, authSecret);
         return;
       }
@@ -608,7 +798,8 @@ function handleRequest(req, res) {
       if (isRecord(rawObject) && rawObject.type === 'agent-games.preflight.v1') {
         try {
           validatePreflight(rawObject);
-        } catch {
+        } catch (error) {
+          log({ kind: 'bad-request', reason: 'preflight-validation', error: error.message, hmacOk: true });
           sendJson(res, 400, { error: 'Bad request' }, authSecret);
           return;
         }
@@ -617,10 +808,24 @@ function handleRequest(req, res) {
         return;
       }
 
+      if (isRecord(rawObject) && rawObject.type === 'agent-games.proof-gatekeeper.v1') {
+        let task;
+        try {
+          task = validateGatekeeperTask(rawObject);
+        } catch (error) {
+          log({ kind: 'bad-request', reason: 'gatekeeper-validation', error: error.message, body: rawObject, hmacOk: true });
+          sendJson(res, 400, { error: 'Bad request' }, authSecret);
+          return;
+        }
+        sendJson(res, 200, await processGatekeeper(task, rawObject), authSecret);
+        return;
+      }
+
       try {
         envelope = validateTurnEnvelope(rawObject);
         hashForAction(envelope, { type: 'HOLD' });
-      } catch {
+      } catch (error) {
+        log({ kind: 'bad-request', reason: 'turn-validation', error: error.message, bodyType: isRecord(rawObject) ? (rawObject.type || null) : typeof rawObject, hmacOk: true });
         sendJson(res, 400, { error: 'Bad request' }, authSecret);
         return;
       }
@@ -658,6 +863,8 @@ async function main() {
       secretSet: SECRETS.length > 0,
       saltSet: SALT.length > 0,
       vkLoaded: Boolean(VK),
+      gkVkLoaded: Boolean(GK_VK),
+      seenProofTx: seenProofTx.size,
     });
   });
 }
