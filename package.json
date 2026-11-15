@@ -1,0 +1,1 @@
+{"description":"Steal the VFY tournament agent plumbing for zkVerify Agent Games (Cloudflare Worker). Proof module is a stub.","license":"UNLICENSED","main":"worker.js","name":"steal-the-vfy-agent","private":true,"scripts":{"test":"node --test test/worker.test.mjs"},"type":"module","version":"0.1.0"}
