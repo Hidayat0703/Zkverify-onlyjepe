@@ -15,6 +15,11 @@
  * Env (in .env, mode 600, never committed):
  *   AGENT_GAMES_HMAC_SECRET — platform-generated secret. Required; the server
  *     fails closed (HTTP 500) when it is missing or empty.
+ *   AGENT_GAMES_HMAC_SECRETS — comma-separated list of platform-generated
+ *     secrets (one per registered agent sharing this endpoint). A request is
+ *     accepted when ANY listed secret matches; responses are signed with the
+ *     secret that authenticated the request. When set (non-empty), it takes
+ *     precedence over AGENT_GAMES_HMAC_SECRET.
  *   STRATEGY_SALT — decimal string, random 128-bit, generated on the host.
  *   STRATEGY_PARAMS — JSON array of 8 decimal strings.
  *     params[4..7] must be "0".
@@ -57,7 +62,19 @@ const getEnv = (name) => (process.env[name] !== undefined ? process.env[name] : 
 
 const PORT = Number(getEnv('PORT') || 3123);
 const HOST = '127.0.0.1';
-const SECRET = getEnv('AGENT_GAMES_HMAC_SECRET') || '';
+// Multi-secret: AGENT_GAMES_HMAC_SECRETS is a comma-separated list; a request
+// is accepted when ANY listed secret matches. Falls back to the single
+// AGENT_GAMES_HMAC_SECRET when the list is absent or empty.
+const SECRETS = (() => {
+  const list = (getEnv('AGENT_GAMES_HMAC_SECRETS') || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (list.length > 0) return list;
+  const single = getEnv('AGENT_GAMES_HMAC_SECRET') || '';
+  return single ? [single] : [];
+})();
+const SECRET = SECRETS[0] || '';
 const SALT = getEnv('STRATEGY_SALT') || '';
 const HMAC_KEY_ENCODING = getEnv('HMAC_KEY_ENCODING') || 'utf8';
 
@@ -174,19 +191,42 @@ function keccak256(bytes) {
 
 // --------------------------------------------------------------- hmac -----
 
-function hmacKey() {
-  if (!SECRET) throw new Error('HMAC key unavailable');
+function hmacKeyFor(secret) {
+  if (!secret) throw new Error('HMAC key unavailable');
   if (HMAC_KEY_ENCODING === 'hex') {
-    if (!/^[a-fA-F0-9]+$/.test(SECRET) || SECRET.length % 2 !== 0) {
+    if (!/^[a-fA-F0-9]+$/.test(secret) || secret.length % 2 !== 0) {
       throw new Error('HMAC key is not valid hex');
     }
-    return Buffer.from(SECRET, 'hex');
+    return Buffer.from(secret, 'hex');
   }
-  return Buffer.from(SECRET, 'utf8');
+  return Buffer.from(secret, 'utf8');
+}
+
+function hmacSha256HexWith(secret, bytes) {
+  return crypto.createHmac('sha256', hmacKeyFor(secret)).update(bytes).digest('hex');
 }
 
 function hmacSha256Hex(bytes) {
-  return crypto.createHmac('sha256', hmacKey()).update(bytes).digest('hex');
+  return hmacSha256HexWith(SECRET, bytes);
+}
+
+// Returns the secret that authenticates the header value, or null when none
+// matches. Throws when secrets are configured but none yields a usable key
+// (config error -> caller fails closed with 500).
+function matchedSecret(bytes, headerValue) {
+  let anyKeyOk = false;
+  for (const secret of SECRETS) {
+    let expected;
+    try {
+      expected = hmacSha256HexWith(secret, bytes);
+    } catch {
+      continue;
+    }
+    anyKeyOk = true;
+    if (signaturesEqual(expected, headerValue)) return secret;
+  }
+  if (!anyKeyOk && SECRETS.length > 0) throw new Error('no usable HMAC key');
+  return null;
 }
 
 function signaturesEqual(expectedHex, headerValue) {
@@ -470,12 +510,13 @@ function log(obj) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), ...obj }));
 }
 
-function sendJson(res, status, obj) {
+function sendJson(res, status, obj, signingSecret) {
   const bytes = Buffer.from(JSON.stringify(obj), 'utf8');
   const headers = { 'content-type': 'application/json' };
-  if (SECRET) {
+  const key = signingSecret || SECRET;
+  if (key) {
     try {
-      headers['x-agent-games-signature'] = hmacSha256Hex(bytes);
+      headers['x-agent-games-signature'] = hmacSha256HexWith(key, bytes);
     } catch {
       // Signing failure: never emit an unsigned success body.
       res.writeHead(500, { 'content-type': 'application/json' });
@@ -529,23 +570,23 @@ function handleRequest(req, res) {
     if (aborted) return;
     const rawBytes = Buffer.concat(chunks);
     let authenticated = false;
+    let authSecret = null;
     let envelope = null;
     let rawObject = null;
     try {
-      if (!SECRET) {
+      if (SECRETS.length === 0) {
         res.writeHead(500, { 'content-type': 'application/json' });
         res.end('{"error":"Internal server error"}');
         return;
       }
-      let expected;
       try {
-        expected = hmacSha256Hex(rawBytes);
+        authSecret = matchedSecret(rawBytes, req.headers['x-agent-games-signature']);
       } catch {
         res.writeHead(500, { 'content-type': 'application/json' });
         res.end('{"error":"Internal server error"}');
         return;
       }
-      const hmacOk = signaturesEqual(expected, req.headers['x-agent-games-signature']);
+      const hmacOk = authSecret !== null;
       if (!hmacOk) {
         log({ kind: 'auth', hmacOk: false, method: req.method, path: req.url });
         sendJson(res, 401, { error: 'Unauthorized' });
@@ -554,13 +595,13 @@ function handleRequest(req, res) {
       authenticated = true;
 
       if (req.method !== 'POST') {
-        sendJson(res, 400, { error: 'Bad request' });
+        sendJson(res, 400, { error: 'Bad request' }, authSecret);
         return;
       }
       try {
         rawObject = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(rawBytes));
       } catch {
-        sendJson(res, 400, { error: 'Bad request' });
+        sendJson(res, 400, { error: 'Bad request' }, authSecret);
         return;
       }
 
@@ -568,11 +609,11 @@ function handleRequest(req, res) {
         try {
           validatePreflight(rawObject);
         } catch {
-          sendJson(res, 400, { error: 'Bad request' });
+          sendJson(res, 400, { error: 'Bad request' }, authSecret);
           return;
         }
         log({ kind: 'preflight', hmacOk: true });
-        sendJson(res, 200, { ok: true, protocolVersion: 'v1' });
+        sendJson(res, 200, { ok: true, protocolVersion: 'v1' }, authSecret);
         return;
       }
 
@@ -580,22 +621,22 @@ function handleRequest(req, res) {
         envelope = validateTurnEnvelope(rawObject);
         hashForAction(envelope, { type: 'HOLD' });
       } catch {
-        sendJson(res, 400, { error: 'Bad request' });
+        sendJson(res, 400, { error: 'Bad request' }, authSecret);
         return;
       }
 
-      sendJson(res, 200, await processTurn(envelope));
+      sendJson(res, 200, await processTurn(envelope), authSecret);
     } catch {
       if (authenticated && rawObject) {
         try {
           envelope = envelope || validateTurnEnvelope(rawObject);
           log({ kind: 'turn', matchId: envelope.matchId, turn: envelope.turn, action: 'HOLD', reason: 'catch-all' });
-          sendJson(res, 200, buildTurnResponse(envelope, { type: 'HOLD' }));
+          sendJson(res, 200, buildTurnResponse(envelope, { type: 'HOLD' }), authSecret);
           return;
         } catch { /* fall through */ }
       }
       try {
-        sendJson(res, authenticated ? 400 : 500, { error: authenticated ? 'Bad request' : 'Internal server error' });
+        sendJson(res, authenticated ? 400 : 500, { error: authenticated ? 'Bad request' : 'Internal server error' }, authSecret);
       } catch {
         res.writeHead(500, { 'content-type': 'application/json' });
         res.end('{"error":"Internal server error"}');
@@ -613,7 +654,8 @@ async function main() {
       host: HOST,
       port: PORT,
       hmacEncoding: HMAC_KEY_ENCODING,
-      secretSet: SECRET.length > 0,
+      secretCount: SECRETS.length,
+      secretSet: SECRETS.length > 0,
       saltSet: SALT.length > 0,
       vkLoaded: Boolean(VK),
     });
